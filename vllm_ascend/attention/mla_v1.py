@@ -31,6 +31,7 @@ from vllm_ascend.attention.tree_spec import (
     MlaTreeSpecAdapter,
     tree_decode_threshold,
     tree_spec_enabled,
+    tree_treat_short_extends_as_decodes,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -612,7 +613,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=common_attn_metadata.context_parallel_metadata is None,
+                treat_short_extends_as_decodes=tree_treat_short_extends_as_decodes(
+                    common_attn_metadata,
+                    tree_enabled=self.tree_spec_enabled,
+                    extra_disable=False,
+                ),
             )
         )
         self.set_num_actual_tokens(common_attn_metadata)
