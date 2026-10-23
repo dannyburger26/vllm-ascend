@@ -235,7 +235,28 @@ class NPUPlatform(Platform):
         decode_query_len = 1
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config and speculative_config.num_speculative_tokens:
-            decode_query_len += speculative_config.num_speculative_tokens
+            from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+            if dflash_tree_spec_enabled(vllm_config):
+                from vllm_ascend.worker.v2.spec_decode import (
+                    dsv4_dspark_draft,
+                )
+
+                if dsv4_dspark_draft(vllm_config):
+                    tree_cfg = getattr(vllm_config, "additional_config", None) or {}
+                    tree_spec = tree_cfg.get("tree_spec_config") or {}
+                    spec_n = speculative_config.num_speculative_tokens
+                    topk = int(tree_spec.get("topk") or 1)
+                    if topk <= 1:
+                        decode_query_len = 1 + spec_n
+                    else:
+                        decode_query_len = 1 + int(tree_spec.get("budget") or spec_n)
+                else:
+                    # apply_config_platform_defaults runs before init_ascend_config.
+                    tree_cfg = getattr(vllm_config, "additional_config", None) or {}
+                    decode_query_len = 1 + (tree_cfg.get("tree_spec_config") or {})["budget"]
+            else:
+                decode_query_len = 1 + speculative_config.num_speculative_tokens
 
         return min(max_num_seqs * decode_query_len, 512)
 
