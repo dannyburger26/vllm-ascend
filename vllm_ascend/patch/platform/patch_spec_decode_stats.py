@@ -63,15 +63,15 @@ def _patch_tree_verify_width(scheduler_cls) -> None:
             output = original_schedule(self, *args, **kwargs)
         finally:
             self.num_spec_tokens = draft_depth
-        output.num_spec_tokens_to_schedule = draft_depth
+        output.num_spec_tokens_to_schedule = verify_width
         async_placeholder = getattr(self, "_spec_token_placeholders", None)
-        if async_placeholder is not None and len(async_placeholder) != draft_depth:
-            depth_placeholder = [-1] * draft_depth
-            self._spec_token_placeholders = depth_placeholder
+        if async_placeholder is not None and len(async_placeholder) != verify_width:
+            width_placeholder = [-1] * verify_width
+            self._spec_token_placeholders = width_placeholder
             for req_id in output.num_scheduled_tokens:
                 request = self.requests[req_id]
                 if request.spec_token_ids is async_placeholder:
-                    request.spec_token_ids = depth_placeholder
+                    request.spec_token_ids = width_placeholder
         return output
 
     schedule._ascend_tree_verify_width = True
