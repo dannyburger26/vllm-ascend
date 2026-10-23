@@ -121,6 +121,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        dp_sync=None,
     ) -> torch.Tensor:
         self.input_batch = input_batch
         with build_attn_metadata_wrapper():

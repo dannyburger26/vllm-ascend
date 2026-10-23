@@ -300,10 +300,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if self.draft_backend == "dspark":
             from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
             from vllm_ascend.models.qwen3_dspark import process_weight
-            from vllm_ascend.utils import get_rotation_matrix, get_rotation_path
 
             model = load_dspark_model(target_model, self.vllm_config)
-            rotation_path = get_rotation_path(self.vllm_config)
+            # QuaRot rotation helpers are absent in this uploaded tree; skip
+            # rotation when they are unavailable so the base path proceeds.
+            try:
+                from vllm_ascend.utils import get_rotation_matrix, get_rotation_path  # noqa: F401
+
+                rotation_path = get_rotation_path(self.vllm_config)
+            except ImportError:
+                rotation_path = None
             if rotation_path is not None and hasattr(model.model, "fc"):
                 rotation_weight = get_rotation_matrix(rotation_path)
                 fc = model.model.fc

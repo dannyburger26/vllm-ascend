@@ -79,4 +79,7 @@ import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
 # VLLM_ASCEND_TRACE_NPU_EVENTS=1). Used to localise the "
 # rtEventDestroy / aclrtDestroyEventImpl" worker segfault; delete together with
 # vllm_ascend/patch/worker/patch_trace_npu_events.py when done.
-import vllm_ascend.patch.worker.patch_trace_npu_events  # noqa
+try:  # vllm-ascend patch: file absent in uploaded tree
+    import vllm_ascend.patch.worker.patch_trace_npu_events  # noqa
+except ModuleNotFoundError:
+    pass
