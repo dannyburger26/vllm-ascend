@@ -1,10 +1,13 @@
 from functools import wraps
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+logger = init_logger("vllm.tree_verify_width")
 
 
 def _observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
@@ -31,13 +34,17 @@ SpecDecodingStats.observe_draft = _observe_draft
 def _tree_verify_width(scheduler) -> int:
     vllm_config = scheduler.vllm_config
     tree_config = get_ascend_config().tree_spec_config
-    if (
-        vllm_config.model_config.enforce_eager
-        and dflash_tree_spec_enabled(vllm_config)
-        and int(tree_config.topk or 0) > 1
-    ):
-        return max(scheduler.num_spec_tokens, int(tree_config.budget))
-    return scheduler.num_spec_tokens
+    eager = vllm_config.model_config.enforce_eager
+    tree_on = dflash_tree_spec_enabled(vllm_config)
+    topk = int(tree_config.topk or 0)
+    budget = int(tree_config.budget or 0)
+    num_spec = scheduler.num_spec_tokens
+    result = max(num_spec, budget) if (eager and tree_on and topk > 1) else num_spec
+    logger.warning(
+        "[TREE-WIDTH] cls=%s eager=%s tree_on=%s topk=%s budget=%s num_spec=%s -> %s",
+        type(scheduler).__name__, eager, tree_on, topk, budget, num_spec, result,
+    )
+    return result
 
 
 def _patch_tree_verify_width(scheduler_cls) -> None:
