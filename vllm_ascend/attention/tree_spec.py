@@ -216,6 +216,22 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
         )
 
 
+class MlaTreeSpecAdapter(TreeSpecAttnAdapter):
+    """MLA (Xing4_0) target 侧树元数据。
+
+    mask 构建复用 GQA 的 AttentionMaskBuilder 4D→3D 链路；内核消费走
+    ``mla_v1`` 的 BSND 树分支（Q5 未决时可退 TND）。
+    """
+
+    def configure_builder(self, builder, vllm_config: VllmConfig, device: torch.device) -> None:
+        query_len = tree_decode_threshold(vllm_config)
+        builder.attn_mask_builder.configure_tree_mask(
+            max_num_decode=int(vllm_config.scheduler_config.max_num_seqs),
+            query_len=query_len,
+            kv_len=align_up(int(vllm_config.model_config.max_model_len), 128),
+        )
+
+
 def _positions_to_slots(positions, block_table, req_ids, block_size):
     nblocks = block_table.shape[1]
     block_nums = torch.div(positions, block_size, rounding_mode="floor")

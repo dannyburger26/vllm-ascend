@@ -22,8 +22,16 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.attention_mask import (
+    AttentionMaskBuilder,
+    tree_fia_bsnd_shape,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.tree_spec import (
+    MlaTreeSpecAdapter,
+    tree_decode_threshold,
+    tree_spec_enabled,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -417,14 +425,19 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
+        self.tree_spec_enabled = tree_spec_enabled()
+        self.tree_adapter = MlaTreeSpecAdapter() if self.tree_spec_enabled else None
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
-                f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
-                got {self.decode_threshold}"
-            )
+            if self.tree_spec_enabled:
+                self.decode_threshold = tree_decode_threshold(vllm_config)
+            else:
+                self.decode_threshold = 1 + spec_token_num
+                assert self.decode_threshold <= 16, (
+                    f"decode_threshold exceeded \
+                    npu_fused_infer_attention_score TND layout's limit of 16, \
+                    got {self.decode_threshold}"
+                )
 
         self.reorder_batch_threshold = self.decode_threshold
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
@@ -448,6 +461,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.query_lens: torch.Tensor = None
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        if self.tree_adapter is not None:
+            self.tree_adapter.configure_builder(self, vllm_config, device)
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -832,7 +847,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             seq_lens_device=seq_lens_device[: len(seq_lens_list)],
             seq_lens_list=seq_lens_list,
             max_seq_lens=max_seq_lens,
-            attn_mask=self.attn_mask_builder.get_splitfuse_attn_mask(),
+            attn_mask=self.attn_mask_builder.get_attention_mask(
+                common_attn_metadata.causal,
+                self.model_config,
+                tree_visibility=common_attn_metadata.tree_visibility,
+                seq_lens=self.seq_lens,
+                num_decode=self.num_decodes,
+                num_tokens=common_attn_metadata.num_actual_tokens,
+                for_capture=common_attn_metadata.for_cudagraph_capture,
+            ),
             actual_seq_lengths_q=actual_seq_lengths_q,
             sin=sin[: self.num_decode_tokens, ...],
             cos=cos[: self.num_decode_tokens, ...],
@@ -1719,6 +1742,58 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             k_nope = k_nope.view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
+
+        # === Tree spec decode (FR6) =========================================
+        # Packed k × (1+budget) BSND verify with a 3D custom tree mask.
+        # Q5 PENDING: MLA v2 kernel 4D/3D-mask + BSND S>1 support is UNVERIFIED
+        # on real hardware. If the kernel rejects this, fall back to per-request
+        # TND (sparse_mode=3 + splitfuse) — see FR6-MLA读侧方案草稿 §3.
+        tree_bsnd = None
+        if (
+            tree_spec_enabled()
+            and not _EXTRA_CTX.is_draft_model
+            and decode_meta.attn_mask is not None
+            and decode_meta.attn_mask.ndim == 4
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+            and decode_meta.block_table is not None
+        ):
+            bsnd = tree_fia_bsnd_shape(num_tokens)
+            if bsnd is not None and bsnd[0] == attn_metadata.num_decodes:
+                tree_bsnd = bsnd
+
+        if tree_bsnd is not None:
+            k, q_len = tree_bsnd
+            fia_q_nope = q_nope[: k * q_len].view(k, q_len, self.num_heads, -1).contiguous()
+            fia_q_pe = q_pe[: k * q_len].view(k, q_len, self.num_heads, -1)
+            if self.head_padding > 0:
+                fia_q_pe = F.pad(fia_q_pe, (0, 0, 0, self.head_padding), "constant", 0)
+                fia_q_nope = F.pad(fia_q_nope, (0, 0, 0, self.head_padding), "constant", 0)
+            bt = decode_meta.block_table[:k]
+            attn_mask = AttentionMaskBuilder(decode_meta.attn_mask.device).as_bsnd_fia_mask(
+                decode_meta.attn_mask, k, q_len
+            )
+            common_kwargs = {
+                "query_rope": fia_q_pe,
+                "key_rope": k_pe,
+                "num_query_heads": self.num_heads_padded,
+                "num_key_value_heads": self.num_kv_heads,
+                "input_layout": "BSND",
+                "atten_mask": attn_mask,
+                "sparse_mode": 0,
+                "softmax_scale": self.scale,
+                "block_table": bt,
+                "block_size": block_size,
+                "actual_seq_qlen": [q_len] * k,
+                "actual_seq_kvlen": decode_meta.seq_lens_list[:k],
+                "return_softmax_lse": False,
+            }
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                fia_q_nope, k_nope, k_nope, **common_kwargs
+            )
+            if self.head_padding > 0:
+                attn_output = attn_output[: self.num_heads]
+            return self._v_up_proj(attn_output)
 
         attn_output_shape: tuple | None = None
         if (
