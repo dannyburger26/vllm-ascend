@@ -75,6 +75,9 @@ class AscendConfig:
         finegrained_tp_config = additional_config.get("finegrained_tp_config", {})
         self.finegrained_tp_config = FinegrainedTPConfig(finegrained_tp_config, vllm_config)
 
+        tree_spec_config = additional_config.get("tree_spec_config", {})
+        self.tree_spec_config = TreeSpecConfig(tree_spec_config)
+
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
 
@@ -951,6 +954,105 @@ class ShortRequestFirstConfig:
             raise ValueError(f"short_request_first_config.long_max_wait_ms must be >= 0; got {self.long_max_wait_ms}")
 
 
+class TreeSpecConfig:
+    """Draft-tree construction from ``additional_config[\"tree_spec_config\"]``.
+
+    When ``enabled`` is true, the v2 parallel-draft tree host expands shared
+    depth logits into a draft tree instead of a single linear draft chain, and
+    ``method`` / ``budget`` / ``topk`` are required. Target verification
+    compares token IDs.
+
+    ``method`` selects the topology builder and must match
+    ``speculative_config.method`` (draft backend):
+
+    - ``beam`` -> ``dspark`` (level-wise beam / PCTree; Markov on Qwen3 DSpark)
+    - ``prefix`` -> ``dflash`` (uniform-width supertree + Top-B prune)
+
+    There is no default; ``method`` must be set when enabled. Pairing is
+    checked again when the tree builder is created.
+
+    ``budget`` is the per-request node budget excluding the already-accepted
+    root; it must be >= ``num_speculative_tokens``.
+
+    ``topk`` is the per-depth expansion width **k**: how many children each
+    parent keeps. It is independent of ``budget``.
+
+    ``params`` is an open dict for method-specific knobs. Unknown keys are
+    kept (builders ignore what they do not recognize).
+
+    ``enable_triton`` (default True) runs tree hot-path Triton kernels when
+    Triton is available; set False to force torch fallbacks.
+    """
+
+    SUPPORTED_METHODS: tuple[str, ...] = ("beam", "prefix")
+    PREFIX_PARAM_KEYS: frozenset[str] = frozenset({"candidate_size"})
+
+    def __init__(self, tree_spec_config: dict | None = None):
+        if tree_spec_config is None:
+            tree_spec_config = {}
+        elif not isinstance(tree_spec_config, dict):
+            raise ValueError(
+                f"additional_config.tree_spec_config must be a dict, "
+                f"got {type(tree_spec_config).__name__}."
+            )
+        self.enabled = bool(tree_spec_config.get("enabled", False))
+        self.method = tree_spec_config.get("method")
+        budget = tree_spec_config.get("budget")
+        topk = tree_spec_config.get("topk")
+        self.budget = int(budget) if budget is not None else None
+        self.topk = int(topk) if topk is not None else None
+        params = tree_spec_config.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"tree_spec_config.params must be a dict, got {type(params).__name__}."
+            )
+        self.params = params
+        self.enable_timer = bool(tree_spec_config.get("enable_timer", False))
+        self.enable_triton = bool(tree_spec_config.get("enable_triton", True))
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.method is not None and self.method not in self.SUPPORTED_METHODS:
+            raise ValueError(
+                f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "
+                f"got {self.method!r}"
+            )
+        if self.enabled and self.method is None:
+            raise ValueError(
+                "tree_spec_config.method is required when enabled "
+                f"(one of {self.SUPPORTED_METHODS})"
+            )
+        if self.enabled and (self.budget is None or self.topk is None):
+            raise ValueError(
+                "tree_spec_config.budget and tree_spec_config.topk are required when enabled"
+            )
+        if self.budget is not None and self.budget < 0:
+            raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
+        if self.topk is not None and self.topk < 1:
+            raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
+        unknown = set(self.params) - self.PREFIX_PARAM_KEYS
+        if unknown:
+            logger.warning_once(
+                "tree_spec_config.params has unrecognized keys %s; "
+                "current builders ignore them.",
+                sorted(unknown),
+            )
+
+    def _validate_method_backend(self, vllm_config) -> None:
+        """Raise if ``method`` does not match ``speculative_config`` draft backend."""
+        if not self.enabled or self.method is None:
+            return
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+            validate_tree_method_backend,
+        )
+
+        draft_backend = "dspark" if speculative_config.use_dspark() else "dflash"
+        validate_tree_method_backend(self.method, draft_backend)
+
+
 class SchedulerConfig:
     """Configuration object for ``additional_config[\"scheduler_config\"]``."""
 
@@ -1103,6 +1205,7 @@ def init_ascend_config(vllm_config):
     ):
         return _ASCEND_CONFIG
     new_config = AscendConfig(vllm_config)
+    new_config.tree_spec_config._validate_method_backend(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
     else:
