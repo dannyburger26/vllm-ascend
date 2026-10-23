@@ -1748,6 +1748,20 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Q5 PENDING: MLA v2 kernel 4D/3D-mask + BSND S>1 support is UNVERIFIED
         # on real hardware. If the kernel rejects this, fall back to per-request
         # TND (sparse_mode=3 + splitfuse) — see FR6-MLA读侧方案草稿 §3.
+        # DEBUG: diagnose why tree_bsnd may be None (fallthrough to TND).
+        if tree_spec_enabled() and not _EXTRA_CTX.is_draft_model:
+            _m = decode_meta.attn_mask
+            logger.warning(
+                "[TREE-DBG] num_tokens=%s num_decodes=%s num_prefills=%s "
+                "block_table=%s mask_ndim=%s mask_shape=%s bsnd=%s",
+                num_tokens,
+                attn_metadata.num_decodes,
+                attn_metadata.num_prefills,
+                decode_meta.block_table is not None,
+                None if _m is None else _m.ndim,
+                None if _m is None else tuple(_m.shape),
+                tree_fia_bsnd_shape(num_tokens),
+            )
         tree_bsnd = None
         if (
             tree_spec_enabled()
