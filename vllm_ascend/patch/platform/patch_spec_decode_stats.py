@@ -4,7 +4,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.worker.v2.spec_decode import dsv4_dspark_draft
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 
 def _observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
@@ -33,7 +33,7 @@ def _tree_verify_width(scheduler) -> int:
     tree_config = get_ascend_config().tree_spec_config
     if (
         vllm_config.model_config.enforce_eager
-        and dsv4_dspark_draft(vllm_config)
+        and dflash_tree_spec_enabled(vllm_config)
         and int(tree_config.topk or 0) > 1
     ):
         return max(scheduler.num_spec_tokens, int(tree_config.budget))
