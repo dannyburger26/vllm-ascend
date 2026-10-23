@@ -278,6 +278,7 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         *,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
+        mscale_factor: float = 0.1,
         beta_fast: int = 32,
         beta_slow: int = 1,
         apply_yarn_scaling: bool = True,
@@ -286,6 +287,7 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         extra_kwargs = {
             "extrapolation_factor": extrapolation_factor,
             "attn_factor": attn_factor,
+            "mscale_factor": mscale_factor,
             "beta_fast": beta_fast,
             "beta_slow": beta_slow,
             "apply_yarn_scaling": apply_yarn_scaling,

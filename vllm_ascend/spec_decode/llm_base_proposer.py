@@ -1419,21 +1419,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # `markov_emb` should also be full to match it.
                 # We changed `flash_comm_v1_enabled` to avoid `markov_emb` from being split.
                 with _disable_flash_comm_v1_context():
-                    raw_logits = self.model.compute_logits(sample_hidden_states)
-                    if lmhead_tp_enable():
-                        # Keep the padded shape through the LMHead TP collective,
-                        # then remove dummy sampling rows before grouping them by
-                        # request for Markov decoding.
-                        raw_logits = raw_logits[:num_indices]
+                    # Reduced-vocab drafters (e.g. Qwen3/GLM DSpark speculators
+                    # with `draft_vocab_size`) expose `compute_draft_logits`,
+                    # which returns draft-space logits of the same width as the
+                    # markov bias; the sampled ids are then remapped to target
+                    # ids via `map_draft_to_target`. Full-vocab drafters
+                    # (DeepSeek-V4 DSpark) fall back to `compute_logits`, whose
+                    # vocab already equals the markov vocab.
+                    if hasattr(self.model, "compute_draft_logits"):
+                        raw_logits = self.model.compute_draft_logits(sample_hidden_states)
+                    else:
+                        raw_logits = self.model.compute_logits(sample_hidden_states)
+                        if lmhead_tp_enable():
+                            # Keep the padded shape through the LMHead TP collective,
+                            # then remove dummy sampling rows before grouping them by
+                            # request for Markov decoding.
+                            raw_logits = raw_logits[:num_indices]
                     logits = raw_logits.view(-1, self.num_speculative_tokens, raw_logits.shape[-1])
                     num_blk = logits.shape[0]
                     draft_token_ids = self._dspark_draft_buffer[:num_blk]
                     draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
-                    for idx in range(self.num_speculative_tokens):
-                        markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
-                        logits_bias = self.model.markov_bias(markov_emb)
-                        logits[:, idx].add_(logits_bias)
-                        draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+                    self._dspark_sample(logits, draft_token_ids)
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
@@ -1604,6 +1610,39 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
         return draft_token_ids
+
+    def _dspark_sample(
+        self,
+        logits: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> None:
+        """Sequential DSpark Markov sampling over one block of draft logits.
+        Adds the MarkovHead transition bias to the base logits left-to-right.
+        Both the base logits and the bias live in the draft-vocab space, so
+        they can be added directly; when they do not (e.g. the base logits were
+        produced by a shared target lm_head covering a wider vocab), the bias
+        is zero-padded so the add stays shape-valid and vocab entries outside
+        the markov head receive no correction.
+        Sampled ids are remapped to target ids via ``map_draft_to_target``
+        (identity for full-vocab drafts) before being stored: they seed the
+        next Markov embedding (``markov_w1`` is defined over the target vocab)
+        and are later verified against target tokens by the rejection sampler.
+        """
+        for idx in range(self.num_speculative_tokens):
+            markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
+            logits_bias = self.model.markov_bias(markov_emb)
+            if logits_bias.shape[-1] != logits.shape[-1]:
+                if logits_bias.shape[-1] < logits.shape[-1]:
+                    padded_bias = logits[:, idx].new_zeros((*logits_bias.shape[:-1], logits.shape[-1]))
+                    padded_bias[..., : logits_bias.shape[-1]].copy_(logits_bias)
+                    logits_bias = padded_bias
+                else:
+                    logits_bias = logits_bias[..., : logits.shape[-1]]
+            logits[:, idx].add_(logits_bias)
+            draft_ids = logits[:, idx].argmax(dim=-1)
+            if hasattr(self.model, "map_draft_to_target"):
+                draft_ids = self.model.map_draft_to_target(draft_ids)
+            draft_token_ids[:, idx + 1].copy_(draft_ids)
 
     def set_inputs_first_pass(
         self,
