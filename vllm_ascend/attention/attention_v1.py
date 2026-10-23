@@ -767,6 +767,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_keys = [attn_keys[index % num_layers] for index in range(graph_param_count)]
             attn_count = 0
             layer_count = 0
+            tree_kv_lens = None
+            tree_attn_mask = None
+            tree_block_tables = None
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     attn_keys,
@@ -829,6 +832,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             sparse_mode = 0
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
+                        metadata = attn_metadata[metadata_key]
                         seq_lens = attn_metadata[metadata_key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
                         # NOTE:
@@ -843,9 +847,51 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             block_tables = attn_metadata[metadata_key].block_tables
                     layer_count += 1
 
-                    torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
                     extra_args = {}
+                    if getattr(query, "ndim", 0) == 4 and c8_k_aq_scale is None:
+                        # Tree decode capture used BSND + sparse_mode=0.
+                        # Pad to captured B before graph_task_update_begin:
+                        # ZerosLike/cat inside the update region aborts the task.
+                        input_layout = "BSND"
+                        sparse_mode = 0
+                        q_len = query.shape[1]
+                        n_dec = query.shape[0]
+                        actual_seq_lengths_q = [q_len] * n_dec
+                        if tree_kv_lens is None:
+                            seq_lens = list(seq_lens[:n_dec])
+                            if len(seq_lens) < n_dec:
+                                seq_lens = seq_lens + [1] * (n_dec - len(seq_lens))
+                            tree_kv_lens = seq_lens
+                            if metadata.attn_mask is not None:
+                                tree_attn_mask = (
+                                    AscendAttentionBackendImpl._bsnd_tree_attn_mask(
+                                        metadata.attn_mask, n_dec, q_len
+                                    )
+                                )
+                            if metadata.block_tables is not None:
+                                block_tables = metadata.block_tables
+                                if block_tables.shape[0] < n_dec:
+                                    block_tables = torch.cat(
+                                        (
+                                            block_tables,
+                                            block_tables.new_zeros(
+                                                (
+                                                    n_dec - block_tables.shape[0],
+                                                    block_tables.shape[1],
+                                                )
+                                            ),
+                                        ),
+                                        dim=0,
+                                    )
+                                else:
+                                    block_tables = block_tables[:n_dec]
+                                tree_block_tables = block_tables
+                        seq_lens = tree_kv_lens
+                        if tree_attn_mask is not None:
+                            attn_mask = tree_attn_mask
+                        if tree_block_tables is not None:
+                            block_tables = tree_block_tables
                     if c8_k_aq_scale is not None:
                         extra_args = {
                             "key_antiquant_scale": c8_k_aq_scale,
@@ -856,6 +902,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         }
                         input_layout = "BNSD"
                         sparse_mode = 0
+                    torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
                         key=key_cache,
