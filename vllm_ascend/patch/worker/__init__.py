@@ -53,6 +53,7 @@ import vllm_ascend.patch.worker.patch_eagle3_init  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
+import vllm_ascend.patch.worker.patch_xing4_0  # noqa
 
 # vLLM's use_v2_model_runner may enable the v2 runner without the
 # VLLM_USE_V2_MODEL_RUNNER env var (e.g. based on model architecture).
@@ -73,3 +74,9 @@ import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
 
 # only patch routed experts capture in main2main.
 import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
+
+# Debug-only probe for AscendCL event lifetimes (no-op unless
+# VLLM_ASCEND_TRACE_NPU_EVENTS=1). Used to localise the "
+# rtEventDestroy / aclrtDestroyEventImpl" worker segfault; delete together with
+# vllm_ascend/patch/worker/patch_trace_npu_events.py when done.
+import vllm_ascend.patch.worker.patch_trace_npu_events  # noqa

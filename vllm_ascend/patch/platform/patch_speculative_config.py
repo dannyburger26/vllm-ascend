@@ -40,6 +40,11 @@ def _update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         "target_layer_ids": [i - 1 for i in aux_layer_ids],
     }
     pre_trained_config["sample_from_anchor"] = config_dict.get("sample_from_anchor", False)
+    # V2 DSpark chooses the query layout from this field. Preserve the legacy
+    # bonus-anchor default while allowing anchor-first checkpoints to opt out.
+    pre_trained_config["dspark_bonus_anchor"] = bool(
+        config_dict.get("dspark_bonus_anchor", True)
+    )
 
 
 speculator_algos.SUPPORTED_SPECULATORS_TYPES["dspark"] = _update_dspark

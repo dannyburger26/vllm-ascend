@@ -84,7 +84,11 @@ def _triton_rope(
         # m of this program instance
         # ####################################################################
         cos_offsets = tl.arange(0, pad_rope_dim // 2)
-        sin_offsets = tl.arange(pad_rope_dim // 2, pad_rope_dim)
+        # The cache row is [cos(rope_dim/2) | sin(rope_dim/2)], i.e. only
+        # rope_dim wide. The sin half therefore starts at rope_dim/2, not at
+        # pad_rope_dim/2 (they differ whenever rotary_dim is not a power of
+        # two, e.g. 192 -> pad 256).
+        sin_offsets = tl.arange(0, pad_rope_dim // 2) + (rope_dim // 2)
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
@@ -209,7 +213,8 @@ def _triton_rope_siso(
         # m of this program instance
         # ####################################################################
         cos_offsets = tl.arange(0, pad_rope_dim // 2)
-        sin_offsets = tl.arange(pad_rope_dim // 2, pad_rope_dim)
+        # Same cache layout as _triton_rope: the sin half starts at rope_dim/2.
+        sin_offsets = tl.arange(0, pad_rope_dim // 2) + (rope_dim // 2)
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
