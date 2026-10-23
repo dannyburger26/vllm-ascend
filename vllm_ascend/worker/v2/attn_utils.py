@@ -120,6 +120,7 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
     tree_visibility: torch.Tensor | None = None,
     slot_positions: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -166,6 +167,7 @@ def build_attn_metadata(
             tree_visibility=tree_visibility,
             slot_positions=slot_positions,
             for_cudagraph_capture=for_cudagraph_capture,
+            is_prefilling=is_prefilling,
             **common_attn_metadata_extra_kwargs,
         )
 
