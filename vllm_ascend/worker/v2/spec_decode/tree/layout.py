@@ -174,3 +174,75 @@ def finalize_tree_layout_torch(
             )
         out.visibility[:, slot, slot] = True
     return out
+
+
+def finalize_tree_layout_from_state(
+    out: TreeLayout,
+    priority: torch.Tensor,
+    state_tokens: torch.Tensor,
+    state_depths: torch.Tensor,
+    state_parents: torch.Tensor,
+    num_nodes: int,
+    force_torch: bool = False,
+) -> TreeLayout:
+    """Prune a builder pool and finalize links in one NPU-side path.
+
+    The Torch path below (argsort + sort + scatter + gather) materializes
+    intermediate index tensors; ``prune_tree_layout_kernel`` does select +
+    order + remap in one register-resident pass. The Torch path stays for CPU
+    tests and ``force_torch`` callers.
+    """
+    from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
+
+    if not force_torch and use_tree_triton():
+        from vllm_ascend.ops.triton.spec_decode.tree.finalize_layout import (
+            finalize_tree_layout_triton,
+        )
+        from vllm_ascend.ops.triton.spec_decode.tree.prune_layout import (
+            prune_tree_layout_triton,
+        )
+
+        out.tokens.fill_(-1)
+        out.depths.zero_()
+        out.parents.fill_(-1)
+        out.visibility.zero_()
+        out.first_child.fill_(-1)
+        out.next_sibling.fill_(-1)
+        prune_tree_layout_triton(
+            priority,
+            state_tokens,
+            state_depths,
+            state_parents,
+            out.tokens,
+            out.depths,
+            out.parents,
+            num_nodes,
+        )
+        out.num_nodes[:] = num_nodes
+        finalize_tree_layout_triton(
+            out.parents[:, :num_nodes],
+            out.first_child,
+            out.next_sibling,
+            out.visibility,
+            num_nodes,
+        )
+        return out
+
+    kept = priority.argsort(dim=-1, descending=True, stable=True)[:, :num_nodes]
+    kept_ids = (kept + 1).sort(dim=-1).values
+    old_to_new = torch.zeros(
+        (priority.shape[0], priority.shape[1] + 1),
+        dtype=torch.long,
+        device=priority.device,
+    )
+    new_ids = torch.arange(1, num_nodes + 1, device=priority.device, dtype=torch.long)
+    old_to_new.scatter_(1, kept_ids, new_ids.unsqueeze(0).expand(priority.shape[0], -1))
+    parent_ids = old_to_new.gather(1, state_parents.gather(1, kept_ids))
+    return finalize_tree_layout(
+        out,
+        state_tokens.gather(1, kept_ids - 1),
+        state_depths.gather(1, kept_ids - 1),
+        parent_ids,
+        num_nodes,
+        force_torch=True,
+    )

@@ -5,7 +5,11 @@ from typing import ClassVar, Generic, TypeVar
 
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.layout import (
+    TreeLayout,
+    finalize_tree_layout,
+    finalize_tree_layout_from_state,
+)
 
 SUPPORTED_TREE_METHODS: tuple[str, ...] = ("beam", "prefix")
 
@@ -186,6 +190,16 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
         change the policy's score ordering, tie-breaking or pruning rule.
         """
 
+    def _prune_priority(
+        self, state: TreeBuildState, ctx: ScoreContextT
+    ) -> tuple[torch.Tensor, int] | None:
+        """Return ``(priority, num_nodes)`` for the Triton prune fast path.
+
+        Returning ``None`` falls back to ``_select_nodes``. Only the beam
+        policy overrides this to expose its score priorities.
+        """
+        return None
+
     def build(
         self,
         draft_logits: torch.Tensor,
@@ -244,23 +258,45 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
         if not graph_safe:
             tree_time_accum_flush()
         with nullcontext() if graph_safe else tree_time("build_prune"):
-            kept_ids = self._select_nodes(state, ctx)
-            num_nodes = state.num_nodes
-            if kept_ids is None:
-                tokens = state.tokens[:, :num_nodes]
-                depths = state.depths[:, :num_nodes]
-                parent_ids = state.parents[:, 1 : num_nodes + 1]
+            # Beam exposes score priorities so pruning can run in a single
+            # register-resident Triton kernel instead of torch argsort/sort/gather.
+            # Other policies return None and fall back to _select_nodes.
+            priority = None
+            pruned_nodes = None
+            if not graph_safe:
+                pruned = self._prune_priority(state, ctx)
+                if pruned is not None:
+                    priority, pruned_nodes = pruned
+            if priority is not None:
+                tokens = depths = parent_ids = None
             else:
-                tokens = torch.gather(state.tokens, 1, kept_ids - 1)
-                depths = torch.gather(state.depths, 1, kept_ids - 1)
-                old_parents = torch.gather(state.parents, 1, kept_ids)
-                old_to_new = self._old_to_new_buf[:num_reqs, : num_nodes + 1]
-                old_to_new.zero_()
-                num_nodes = kept_ids.shape[1]
-                new_ids = self._budget_ids[:num_nodes].unsqueeze(0)
-                old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, -1))
-                parent_ids = torch.gather(old_to_new, 1, old_parents)
+                kept_ids = self._select_nodes(state, ctx)
+                num_nodes = state.num_nodes
+                if kept_ids is None:
+                    tokens = state.tokens[:, :num_nodes]
+                    depths = state.depths[:, :num_nodes]
+                    parent_ids = state.parents[:, 1 : num_nodes + 1]
+                else:
+                    tokens = torch.gather(state.tokens, 1, kept_ids - 1)
+                    depths = torch.gather(state.depths, 1, kept_ids - 1)
+                    old_parents = torch.gather(state.parents, 1, kept_ids)
+                    old_to_new = self._old_to_new_buf[:num_reqs, : num_nodes + 1]
+                    old_to_new.zero_()
+                    num_nodes = kept_ids.shape[1]
+                    new_ids = self._budget_ids[:num_nodes].unsqueeze(0)
+                    old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, -1))
+                    parent_ids = torch.gather(old_to_new, 1, old_parents)
         with nullcontext() if graph_safe else tree_time("build_finalize_layout"):
+            if priority is not None:
+                return finalize_tree_layout_from_state(
+                    out,
+                    priority,
+                    state.tokens,
+                    state.depths,
+                    state.parents,
+                    pruned_nodes,
+                    force_torch=False,
+                )
             return finalize_tree_layout(
                 out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe
             )

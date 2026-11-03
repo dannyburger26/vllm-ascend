@@ -194,9 +194,11 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
             )
         return frontier, n_add
 
-    def _select_nodes(
+    def _prune_priority(
         self, state: TreeBuildState, ctx: BeamScoreContext
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
+        """Return (priority, num_nodes) without pruning; the caller decides
+        whether to prune via the Triton kernel or the Torch fallback."""
         num_pool = state.num_nodes
         num_nodes = min(self.budget, num_pool)
         pool_scores = state.path_scores[:, 1 : num_pool + 1]
@@ -207,6 +209,13 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
             priority.scatter_(1, greedy_slots, float("inf"))
         else:
             priority = pool_scores
+        return priority, num_nodes
+
+    def _select_nodes(
+        self, state: TreeBuildState, ctx: BeamScoreContext
+    ) -> torch.Tensor:
+        priority, num_nodes = self._prune_priority(state, ctx)
+        num_pool = state.num_nodes
         packed = priority.argsort(dim=-1, descending=True, stable=True)[:, :num_nodes]
         packed_depth = torch.gather(state.depths[:, :num_pool], 1, packed)
         packed_rank = packed_depth * num_pool + packed
