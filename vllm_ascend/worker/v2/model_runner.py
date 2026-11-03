@@ -52,7 +52,12 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
+from vllm_ascend.worker.v2.input_batch import (
+    AscendInputBatch,
+    AscendInputBuffers,
+    fused_tree_layout,
+    prepare_tree_spec_pos_seq_lens,
+)
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.spec_decode import (
     dflash_tree_spec_enabled,
@@ -297,10 +302,8 @@ class NPUModelRunner(GPUModelRunner):
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
 
-            max_expand_len = self.decode_query_len
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, max_expand_len
-            )
+            # expanded_idx_mapping / expanded_local_pos 延迟到下方 combine 处计算：
+            # use_tree_pos 时与 prepare/combine 融合成一个 Triton launch。
 
         # Get query_start_loc.
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
@@ -382,16 +385,18 @@ class NPUModelRunner(GPUModelRunner):
                 torch.from_numpy(is_prefilling_np),
                 device=self.device,
             )
-            prepare_tree_spec_pos_seq_lens(
-                idx_mapping,
-                query_start_loc,
-                is_prefilling,
-                self.req_states.num_computed_tokens.gpu,
-                tree_depths,
-                self.input_buffers.positions,
-                self.input_buffers.slot_positions,
-                self.input_buffers.seq_lens,
-            )
+            if not draft_tokens:
+                # 有 tree 但无 draft（少见）：单独 prepare；有 draft 时在下方融合。
+                prepare_tree_spec_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    is_prefilling,
+                    self.req_states.num_computed_tokens.gpu,
+                    tree_depths,
+                    self.input_buffers.positions,
+                    self.input_buffers.slot_positions,
+                    self.input_buffers.seq_lens,
+                )
         else:
             prepare_pos_seq_lens(
                 idx_mapping,
@@ -407,18 +412,44 @@ class NPUModelRunner(GPUModelRunner):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        if use_tree_pos and draft_tokens:
+            # Fused expand + prepare + combine: one Triton launch instead of
+            # three, eliminating ~0.8ms of inter-kernel schedule gaps.
+            expanded_idx_mapping, expanded_local_pos, logits_indices = fused_tree_layout(
+                idx_mapping,
+                query_start_loc,
+                is_prefilling,
+                self.req_states.num_computed_tokens.gpu,
+                tree_depths,
+                cu_num_logits,
+                self.req_states.last_sampled_tokens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                self.input_buffers.input_ids,
+                self.input_buffers.positions,
+                self.input_buffers.slot_positions,
+                self.input_buffers.seq_lens,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+                self.decode_query_len,
+            )
+        else:
+            if draft_tokens:
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+                )
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.

@@ -318,3 +318,176 @@ def prepare_tree_spec_pos_seq_lens(
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )
+
+
+@triton.jit
+def _fused_tree_layout_kernel(
+    # expand_idx_mapping inputs
+    idx_mapping_ptr,
+    cu_num_logits_ptr,
+    # expand outputs
+    expanded_idx_mapping_ptr,
+    expanded_local_pos_ptr,
+    # prepare_tree_spec_pos_seq_lens inputs
+    query_start_loc_ptr,
+    is_prefilling_ptr,
+    num_computed_tokens_ptr,
+    tree_depths_ptr,
+    tree_depths_stride,
+    max_num_reqs,
+    # prepare outputs
+    pos_ptr,
+    slot_pos_ptr,
+    seq_lens_ptr,
+    # combine_sampled_and_draft inputs
+    last_sampled_tokens_ptr,
+    prefill_len_ptr,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    # combine outputs
+    input_ids_ptr,
+    logits_indices_ptr,
+    NUM_NEW_SAMPLED_TOKENS: tl.constexpr,
+    BLOCK_EXPAND: tl.constexpr,
+    BLOCK_PREPARE: tl.constexpr,
+    BLOCK_COMBINE: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    num_reqs = tl.num_programs(0) - 1
+
+    # Padding program: keep the original _prepare semantics (zero unused seq_lens).
+    if req_id == num_reqs:
+        for i in tl.range(num_reqs, max_num_reqs, BLOCK_PREPARE):
+            block = i + tl.arange(0, BLOCK_PREPARE)
+            mask = block < max_num_reqs
+            tl.store(seq_lens_ptr + block, 0, mask=mask)
+        return
+
+    req_state_idx = tl.load(idx_mapping_ptr + req_id)
+
+    # ① expand_idx_mapping: request -> token-level mapping.
+    cu_start = tl.load(cu_num_logits_ptr + req_id)
+    cu_end = tl.load(cu_num_logits_ptr + req_id + 1)
+    num_logits = cu_end - cu_start
+    block_e = tl.arange(0, BLOCK_EXPAND)
+    mask_e = block_e < num_logits
+    tl.store(expanded_idx_mapping_ptr + cu_start + block_e, req_state_idx, mask=mask_e)
+    tl.store(expanded_local_pos_ptr + cu_start + block_e, block_e, mask=mask_e)
+
+    # ② prepare_tree_spec_pos_seq_lens: seq_lens + RoPE pos + KV slots.
+    query_start = tl.load(query_start_loc_ptr + req_id)
+    query_end = tl.load(query_start_loc_ptr + req_id + 1)
+    query_len = query_end - query_start
+    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+    seq_len = num_computed + query_len
+    tl.store(seq_lens_ptr + req_id, seq_len)
+    is_prefill = tl.load(is_prefilling_ptr + req_id).to(tl.int32)
+    if is_prefill == 1:
+        # Prefill: linear positions (KV slot == rope pos). No early return;
+        # the combine part below still writes logits indices.
+        for i in tl.range(0, query_len, BLOCK_PREPARE):
+            block = i + tl.arange(0, BLOCK_PREPARE)
+            mask = block < query_len
+            linear = num_computed + block
+            tl.store(pos_ptr + query_start + block, linear, mask=mask)
+            tl.store(slot_pos_ptr + query_start + block, linear, mask=mask)
+    else:
+        # Decode: root at num_computed; drafts use tree depth for RoPE.
+        tl.store(pos_ptr + query_start, num_computed)
+        tl.store(slot_pos_ptr + query_start, num_computed)
+        for i in tl.range(1, query_len, BLOCK_PREPARE):
+            block = i + tl.arange(0, BLOCK_PREPARE)
+            mask = block < query_len
+            depth = tl.load(
+                tree_depths_ptr + req_state_idx * tree_depths_stride + block - 1,
+                mask=mask,
+            )
+            rope_pos = depth + num_computed
+            slot_pos = num_computed + block
+            tl.store(pos_ptr + query_start + block, rope_pos, mask=mask)
+            tl.store(slot_pos_ptr + query_start + block, slot_pos, mask=mask)
+
+    # ③ combine_sampled_and_draft: logits indices + rewrite input_ids.
+    block_c = tl.arange(0, BLOCK_COMBINE)
+    logits_start = query_end - num_logits
+    tl.store(
+        logits_indices_ptr + cu_start + block_c,
+        logits_start + block_c,
+        mask=block_c < num_logits,
+    )
+    prefill_len = tl.load(prefill_len_ptr + req_state_idx)
+    if seq_len <= prefill_len:
+        return
+    num_draft = num_logits - NUM_NEW_SAMPLED_TOKENS
+    first_logit_seq_pos = seq_len - num_logits
+    if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
+        last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
+        tl.store(input_ids_ptr + logits_start, last_token_id)
+    if num_draft > 0:
+        mask_d = block_c < num_draft
+        draft = tl.load(
+            draft_tokens_ptr + req_state_idx * draft_tokens_stride + block_c,
+            mask=mask_d,
+        )
+        tl.store(input_ids_ptr + query_end - num_draft + block_c, draft, mask=mask_d)
+
+
+def fused_tree_layout(
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    is_prefilling: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    tree_depths: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
+    pos: torch.Tensor,
+    slot_pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+    total_num_logits: int,
+    num_new_sampled_tokens: int,
+    max_expand_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused expand + prepare + combine for the packed-tree decode step.
+
+    Three per-request Triton kernels are merged into one to eliminate the
+    inter-kernel launch/schedule gaps (~0.8ms in FULL cudagraph replay).
+    Returns ``(expanded_idx_mapping, expanded_local_pos, logits_indices)``.
+    """
+    num_reqs = idx_mapping.shape[0]
+    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
+    expanded_local_pos = torch.empty(
+        total_num_logits, dtype=torch.int32, device=idx_mapping.device
+    )
+    logits_indices = torch.empty(
+        total_num_logits, dtype=torch.int64, device=idx_mapping.device
+    )
+    num_spec = draft_tokens.shape[-1]
+    _fused_tree_layout_kernel[(num_reqs + 1,)](
+        idx_mapping,
+        cu_num_logits,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        query_start_loc,
+        is_prefilling,
+        num_computed_tokens,
+        tree_depths,
+        tree_depths.stride(0),
+        seq_lens.shape[0],
+        pos,
+        slot_pos,
+        seq_lens,
+        last_sampled_tokens,
+        prefill_len,
+        draft_tokens,
+        draft_tokens.stride(0),
+        input_ids,
+        logits_indices,
+        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+        BLOCK_EXPAND=triton.next_power_of_2(max_expand_len),
+        BLOCK_PREPARE=1024,
+        BLOCK_COMBINE=triton.next_power_of_2(num_spec + num_new_sampled_tokens),
+    )
+    return expanded_idx_mapping, expanded_local_pos, logits_indices
