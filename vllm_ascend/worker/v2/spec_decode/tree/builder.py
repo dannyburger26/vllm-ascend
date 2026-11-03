@@ -260,13 +260,15 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
         with nullcontext() if graph_safe else tree_time("build_prune"):
             # Beam exposes score priorities so pruning can run in a single
             # register-resident Triton kernel instead of torch argsort/sort/gather.
-            # Other policies return None and fall back to _select_nodes.
+            # Other policies return None and fall back to _select_nodes. The
+            # Triton prune runs during capture too (matching the upstream
+            # tree261025-rebase port); if NPU graph capture cannot host it,
+            # _capture_tree_graphs falls back to eager.
             priority = None
             pruned_nodes = None
-            if not graph_safe:
-                pruned = self._prune_priority(state, ctx)
-                if pruned is not None:
-                    priority, pruned_nodes = pruned
+            pruned = self._prune_priority(state, ctx)
+            if pruned is not None:
+                priority, pruned_nodes = pruned
             if priority is not None:
                 tokens = depths = parent_ids = None
             else:
