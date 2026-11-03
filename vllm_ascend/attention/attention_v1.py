@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import (
     AttentionMaskBuilder,
+    get_attn_mask_builder,
     tree_fia_bsnd_shape,
 )
 from vllm_ascend.attention.tree_spec import (
@@ -261,7 +262,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
-        self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.attn_mask_builder = get_attn_mask_builder(self.device)
         if self.tree_adapter is not None:
             self.tree_adapter.configure_builder(self, vllm_config, device)
 

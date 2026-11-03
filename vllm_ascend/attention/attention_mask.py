@@ -111,6 +111,13 @@ class AttentionMaskBuilder:
         # this buffer; do not return a temporary cat/contiguous tensor.
         self._tree_fia_bsnd: torch.Tensor | None = None
         self._tree_debug_calls = 0
+        # Tree mask cache: the verify forward calls get_tree_attention_mask
+        # twice (dense + MLA backends) with the same tree. Cache keyed on the
+        # CPU seq_lens (no device sync) so the 2nd call reuses the 1st mask and
+        # skips the rebuild + 4D→3D sync. seq_lens advances >=1 per step (bonus
+        # commit), so a cross-step false hit is impossible.
+        self._tree_mask_cache_seq: torch.Tensor | None = None
+        self._tree_mask_cache_meta: tuple | None = None
 
     def configure_tree_mask(
         self, max_num_decode: int, query_len: int, kv_len: int
@@ -257,7 +264,8 @@ class AttentionMaskBuilder:
                         )
                     return self.get_splitfuse_attn_mask()
                 return self.get_tree_attention_mask(
-                    tree_visibility, seq_lens, num_decode
+                    tree_visibility, seq_lens, num_decode,
+                    for_capture=for_capture,
                 )
 
         if model_config.runner_type == "pooling":
@@ -267,7 +275,8 @@ class AttentionMaskBuilder:
 
     def get_tree_attention_mask(self, tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
-                                num_decode):
+                                num_decode,
+                                for_capture: bool = False):
         from vllm_ascend.worker.v2.spec_decode.tree.timer import (
             tree_time,
             tree_timer_begin_step,
@@ -314,6 +323,13 @@ class AttentionMaskBuilder:
             # Triton needs a contiguous bool→int8 view; sliced caps (kv_len < cap)
             # are non-contiguous and must stay on the torch path.
             mask_slice = attn_mask[:num_mask]
+            # Cache: the 36-layer target verify reuses one tree_visibility. If
+            # visibility/seq_lens are unchanged, reuse the previous mask and skip
+            # the rebuild + 4D→3D sync (the dominant per-layer sync overhead).
+            if not for_capture and self._tree_mask_hit(
+                seq_lens, num_decode, num_mask, query_len, cap_kv
+            ):
+                return attn_mask
             if use_tree_triton() and mask_slice.is_contiguous():
                 from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
                     fill_tree_attention_mask_triton,
@@ -330,6 +346,7 @@ class AttentionMaskBuilder:
                     attn_mask[num_mask:].fill_(True)
                 self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
                 self._log_tree_mask(attn_mask, tree_visibility, seq_lens, query_len)
+                self._tree_mask_save(seq_lens, num_mask, num_decode, query_len, cap_kv)
                 return attn_mask
             attn_mask.fill_(True)
             for i in range(num_mask):
@@ -343,7 +360,25 @@ class AttentionMaskBuilder:
                 req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
             self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
             self._log_tree_mask(attn_mask, tree_visibility, seq_lens, query_len)
+            self._tree_mask_save(seq_lens, num_mask, num_decode, query_len, cap_kv)
             return attn_mask
+
+    def _tree_mask_hit(self, seq_lens, num_decode, num_mask, query_len, cap_kv) -> bool:
+        cached_seq = self._tree_mask_cache_seq
+        if cached_seq is None or self._tree_mask_cache_meta != (
+            num_decode, num_mask, query_len, cap_kv
+        ):
+            return False
+        if cached_seq.numel() < num_mask:
+            return False
+        # seq_lens is host (CPU) metadata; torch.equal here does not sync the
+        # device. Same seq_lens => same step's verify => same tree, so the
+        # cached mask is still valid.
+        return bool(torch.equal(seq_lens[:num_mask], cached_seq[:num_mask]))
+
+    def _tree_mask_save(self, seq_lens, num_mask, num_decode, query_len, cap_kv) -> None:
+        self._tree_mask_cache_seq = seq_lens[:num_mask].clone()
+        self._tree_mask_cache_meta = (num_decode, num_mask, query_len, cap_kv)
 
     def _log_tree_mask(
         self,
@@ -385,3 +420,19 @@ class AttentionMaskBuilder:
     def get_final_mla_mask(self, model_config: ModelConfig):
         # Prefill stages use 512x512 mask with appropriate dtype
         return self.get_mla_mask(model_config.dtype)
+
+
+_ATTENTION_MASK_BUILDER: AttentionMaskBuilder | None = None
+
+
+def get_attn_mask_builder(device: torch.device) -> AttentionMaskBuilder:
+    """Return the singleton attention mask builder shared across backends.
+
+    The dense (AscendAttentionBackend) and MLA (AscendMLABackend) backends both
+    build a tree mask in the same forward step. Sharing one builder makes the
+    second ``get_tree_attention_mask`` a cache hit instead of a rebuild + sync.
+    """
+    global _ATTENTION_MASK_BUILDER
+    if _ATTENTION_MASK_BUILDER is None:
+        _ATTENTION_MASK_BUILDER = AttentionMaskBuilder(device)
+    return _ATTENTION_MASK_BUILDER

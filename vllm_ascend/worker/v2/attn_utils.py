@@ -40,14 +40,16 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.attention_mask import (
+    AttentionMaskBuilder,
+    get_attn_mask_builder,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
 
-_ATTENTION_MASK_BUILDER = None
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -83,14 +85,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             )
 
     return kv_cache_spec
-
-
-def get_attn_mask_builder(device: torch.device):
-    """Get attention mask builder which only have one instance."""
-    global _ATTENTION_MASK_BUILDER
-    if _ATTENTION_MASK_BUILDER is None:
-        _ATTENTION_MASK_BUILDER = AttentionMaskBuilder(device)
-    return _ATTENTION_MASK_BUILDER
 
 
 def build_attn_metadata(

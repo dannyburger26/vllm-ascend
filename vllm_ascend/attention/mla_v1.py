@@ -24,6 +24,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import (
     AttentionMaskBuilder,
+    get_attn_mask_builder,
     tree_fia_bsnd_shape,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -461,7 +462,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.graph_pad_size = 0
         self.query_lens: torch.Tensor = None
         self.seq_lens: torch.Tensor = None
-        self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.attn_mask_builder = get_attn_mask_builder(self.device)
         if self.tree_adapter is not None:
             self.tree_adapter.configure_builder(self, vllm_config, device)
 
