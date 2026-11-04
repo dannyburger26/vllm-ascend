@@ -24,11 +24,7 @@ from vllm.distributed import (
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-)
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -69,34 +65,6 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
     if num_layers is None:
         num_layers = getattr(config, "dspark_num_mtp_layers", 3)
     return int(num_layers or 3)
-
-
-# Keep this implementation identical to the stacked context WKV projection
-# upstream logic: duplicate each draft layer's WKV params into the synthetic
-# context_wkv_proj shards.
-_CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
-
-
-def _duplicate_context_wkv_weights(
-    weights: Iterable[tuple[str, torch.Tensor]],
-    num_layers: int,
-) -> Iterable[tuple[str, torch.Tensor]]:
-    """Duplicate each draft layer's WKV params into the stacked projection."""
-    for name, weight in weights:
-        yield name, weight
-
-        match = _CONTEXT_WKV_RE.fullmatch(name)
-        if match is None:
-            continue
-
-        layer_idx = int(match.group(1))
-        if layer_idx >= num_layers:
-            continue
-
-        stacked_weight = weight.detach()
-        stacked_weight.shard_id = layer_idx
-
-        yield f"context_wkv_proj.{match.group(2)}", stacked_weight
 
 
 class DSparkMarkovHead(nn.Module):
@@ -164,20 +132,6 @@ class DeepseekV4DSparkModel(nn.Module):
         first_layer.main_proj = self.main_proj
         first_layer.main_norm = self.main_norm
 
-        # Stack the WKV projections from all DSpark layers into one linear.
-        # Reuse the first layer's head_dim (nope + rope) as the per-layer
-        # output width of the merged column-parallel projection.
-        self._dspark_head_dim = int(first_layer.self_attn.head_dim)
-        self.context_wkv_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [self._dspark_head_dim] * self.num_dspark_layers,
-            bias=False,
-            return_bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix="mtp.0.self_attn.wkv",
-            disable_tp=True,
-        )
-
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         last_layer_idx = self.mtp_start_layer_idx + self.num_dspark_layers - 1
         self.markov_head = DSparkMarkovHead(
@@ -215,12 +169,12 @@ class DeepseekV4DSparkModel(nn.Module):
 
     def _project_shared_kv(
         self,
-        kv: torch.Tensor,
+        hidden_states: torch.Tensor,
         positions: torch.Tensor,
         attn: type[nn.Module] | None = None,
     ) -> torch.Tensor:
         assert attn is not None
-        kv = attn.kv_norm(kv)
+        kv = attn.kv_norm(attn.wkv(hidden_states))
         k_nope, k_pe = kv.split([attn.nope_head_dim, attn.rope_head_dim], dim=-1)
         k_pe = _apply_dsv4_rope(attn.rotary_emb, positions, k_pe.unsqueeze(1)).squeeze(1)
         return torch.cat([k_nope, k_pe], dim=-1).view(-1, 1, attn.head_dim).contiguous()
@@ -254,23 +208,14 @@ class DeepseekV4DSparkModel(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: list[torch.Tensor | None] | None = None,
     ) -> None:
-        if context_states.numel() == 0 or context_positions.numel() == 0:
+        if context_states.numel() == 0 or context_slot_mapping is None:
             return
-        # All DSpark layers consume the same context hidden states. Stack
-        # their WKV projections into one linear op instead of N layer loops.
-        all_kv = self.context_wkv_proj(context_states).view(
-            context_states.shape[0],
-            self.num_dspark_layers,
-            self._dspark_head_dim,
-        )
-        if context_slot_mapping is None:
-            return
-        for layer_idx, (layer, kv) in enumerate(zip(self.layers.values(), all_kv.unbind(1))):
-            layer_context_slot_mapping = context_slot_mapping[layer_idx]
-            if layer_context_slot_mapping is None:
-                continue
+        for layer_idx, layer in enumerate(self.layers.values()):
+            layer_context_slot_mapping = None if context_slot_mapping is None else context_slot_mapping[layer_idx]
+            if context_positions.numel() == 0:
+                return
             attn = layer.self_attn
-            shared_kv = self._project_shared_kv(kv, context_positions, attn)
+            shared_kv = self._project_shared_kv(context_states, context_positions, attn)
             self._store_standard_swa_kv(shared_kv, layer_context_slot_mapping, attn)
 
     def forward(
@@ -433,9 +378,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
         n_local_head = self.config.num_attention_heads // tp_size
         head_start = n_local_head * tp_rank
         head_end = n_local_head * (tp_rank + 1)
-
-        # Duplicate each draft layer's WKV weights into the stacked projection.
-        weights = _duplicate_context_wkv_weights(weights, self.num_dspark_layers)
 
         for name, loaded_weight in weights:
             if name == "embed.weight" and not self.has_own_embed_tokens:
