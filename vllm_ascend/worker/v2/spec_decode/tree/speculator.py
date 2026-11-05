@@ -119,6 +119,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.budget = tree_cfg.budget
         self.topk = tree_cfg.topk
         self.branch_ks = tree_cfg.branch_ks
+        self.max_branch = max(self.branch_ks) if self.branch_ks is not None else self.topk
         self.params = tree_cfg.params
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
@@ -126,7 +127,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         from vllm_ascend.worker.v2.spec_decode import dsv4_dspark_draft
 
         self._dsv4_dspark_draft = dsv4_dspark_draft(vllm_config)
-        if self._dsv4_dspark_draft and self.topk > 1:
+        # The V4 multi-branch correctness patch gates on the widest layer,
+        # not the fixed topk fallback (branch_ks overrides topk per layer).
+        if self._dsv4_dspark_draft and self.max_branch > 1:
             if not vllm_config.model_config.enforce_eager:
                 raise ValueError("This V4 tree correctness patch requires --enforce-eager")
             parallel = vllm_config.parallel_config
@@ -317,7 +320,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
 
     def packed_dsv4_verify(self) -> bool:
         """Packed ori + skip-C4 target verify (DSV4 DSpark, topk>1)."""
-        return self._dsv4_dspark_draft and self.topk > 1
+        return self._dsv4_dspark_draft and self.max_branch > 1
 
     def load_draft_model(
         self,
@@ -823,7 +826,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             clear_tree_chain_layout,
         )
 
-        if not dummy_run and self.topk > 1:
+        if not dummy_run and self.max_branch > 1:
             request_temperatures = temperature[: input_batch.num_reqs]
             if bool(torch.any(request_temperatures > 1e-5).item()):
                 raise ValueError(
@@ -958,7 +961,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             # FULL replay only runs draft forward; tree construction has its own graph.
             if not dummy_run:
                 self._finalize_tree(input_batch.num_reqs)
-                if self._dsv4_dspark_draft and self.topk == 1:
+                if self._dsv4_dspark_draft and self.max_branch == 1:
                     # Storage capacity is the tree budget; the chain has only K
                     # draft tokens. Never publish the padded suffix to the runner.
                     return tokens[:input_batch.num_reqs, :self.num_speculative_steps]
@@ -1165,7 +1168,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             return
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-        if self._dsv4_dspark_draft and self.topk == 1:
+        if self._dsv4_dspark_draft and self.max_branch == 1:
             with tree_time("dspark_sequential_sample"):
                 self._sample_sequential(num_reqs, self._draft_hidden_buf)
             self._materialize_chain_layout(num_reqs)
