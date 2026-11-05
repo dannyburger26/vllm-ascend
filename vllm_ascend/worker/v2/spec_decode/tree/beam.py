@@ -63,13 +63,28 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
     required_backend = "dspark"
     method = "beam"
 
-    def __init__(self, budget: int, topk: int, draft_model=None):
-        super().__init__(budget, topk)
+    def __init__(
+        self,
+        budget: int,
+        topk: int,
+        draft_model=None,
+        branch_ks: list[int] | None = None,
+    ):
+        super().__init__(budget, topk, branch_ks=branch_ks)
         self.draft_model = draft_model
         self.keep_greedy = envs.VLLM_ASCEND_TREE_KEEP_GREEDY
 
     def _beam_width(self, vocab: int) -> int:
+        # Buffer sizing uses the widest layer; per-layer widths come from
+        # ``_depth_width`` below.
+        if self.branch_ks is not None:
+            return min(max(self.branch_ks), vocab)
         return min(self.topk, vocab)
+
+    def _depth_width(self, max_width: int, depth_slot: int) -> int:
+        if self.branch_ks is not None:
+            return min(self.branch_ks[depth_slot], max_width)
+        return min(self.topk, max_width)
 
     def _pool_capacity(self, width: int, spec_num: int) -> int:
         # Keep every parent-child edge. Only the frontier is pruned to ``width``.
@@ -124,7 +139,8 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
         )
         ctx.next_states = next_states
         log_probs = torch.log_softmax(step_logits.float(), dim=-1)
-        top_vals, top_ids = log_probs.topk(state.width, dim=-1)
+        depth_width = self._depth_width(state.width, depth_slot)
+        top_vals, top_ids = log_probs.topk(depth_width, dim=-1)
         if self.keep_greedy:
             # topk can omit argmax on exact-logit ties. Keep the sequential edge.
             greedy_token = step_logits[ctx.req_ids, ctx.greedy_frontier].argmax(-1)
@@ -138,7 +154,7 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
             greedy_child = (
                 top_ids[ctx.req_ids, ctx.greedy_frontier] == greedy_token[:, None]
             ).long().argmax(-1)
-            ctx.greedy_candidate = ctx.greedy_frontier * state.width + greedy_child
+            ctx.greedy_candidate = ctx.greedy_frontier * depth_width + greedy_child
 
         if self.draft_model is not None:
             top_ids = self.draft_model.map_draft_to_target(top_ids)

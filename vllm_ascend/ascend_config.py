@@ -977,6 +977,11 @@ class TreeSpecConfig:
     ``topk`` is the per-depth expansion width **k**: how many children each
     parent keeps. It is independent of ``budget``.
 
+    ``branch_ks`` (optional, beam only) is a per-depth expansion width list
+    overriding ``topk`` per layer: ``[1, 1, 2, 2, 2, 2, 2]`` keeps the first
+    two layers single-path then two children per parent afterward. ``topk``
+    remains the fixed-width fallback when ``branch_ks`` is absent.
+
     ``params`` is an open dict for method-specific knobs. Unknown keys are
     kept (builders ignore what they do not recognize).
 
@@ -999,8 +1004,12 @@ class TreeSpecConfig:
         self.method = tree_spec_config.get("method")
         budget = tree_spec_config.get("budget")
         topk = tree_spec_config.get("topk")
+        branch_ks = tree_spec_config.get("branch_ks")
         self.budget = int(budget) if budget is not None else None
         self.topk = int(topk) if topk is not None else None
+        self.branch_ks = (
+            [int(k) for k in branch_ks] if branch_ks is not None else None
+        )
         params = tree_spec_config.get("params") or {}
         if not isinstance(params, dict):
             raise ValueError(
@@ -1030,6 +1039,11 @@ class TreeSpecConfig:
             raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
         if self.topk is not None and self.topk < 1:
             raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
+        if self.branch_ks is not None and any(k < 1 for k in self.branch_ks):
+            raise ValueError(
+                "tree_spec_config.branch_ks must be positive per-depth widths, "
+                f"got {self.branch_ks}"
+            )
         unknown = set(self.params) - self.PREFIX_PARAM_KEYS
         if unknown:
             logger.warning_once(

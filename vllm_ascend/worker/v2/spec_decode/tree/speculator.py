@@ -118,6 +118,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.method = tree_cfg.method
         self.budget = tree_cfg.budget
         self.topk = tree_cfg.topk
+        self.branch_ks = tree_cfg.branch_ks
         self.params = tree_cfg.params
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
@@ -197,6 +198,14 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             raise ValueError(
                 "tree_spec_config.budget must be >= num_speculative_tokens "
                 f"({self.num_speculative_steps}), got {self.budget}"
+            )
+        if (
+            self.branch_ks is not None
+            and len(self.branch_ks) != self.num_speculative_steps
+        ):
+            raise ValueError(
+                "tree_spec_config.branch_ks must have one entry per speculative "
+                f"step ({self.num_speculative_steps}), got {len(self.branch_ks)}"
             )
         if self.budget > self.draft_tokens.shape[1]:
             self.draft_tokens = torch.zeros(
@@ -520,6 +529,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             correction_scorer=self._domino_scorer,
             prefix_len=self._domino_prefix_len,
             params=self.params,
+            branch_ks=self.branch_ks,
         )
         markov_head = getattr(model, "markov_head", None)
         if markov_head is None:

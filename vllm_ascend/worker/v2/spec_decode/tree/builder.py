@@ -52,9 +52,10 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
     required_backend: ClassVar[str]
     method: ClassVar[str]
 
-    def __init__(self, budget: int, topk: int):
+    def __init__(self, budget: int, topk: int, branch_ks: list[int] | None = None):
         self.budget = budget
         self.topk = topk
+        self.branch_ks = list(branch_ks) if branch_ks is not None else None
         self._scratch_reqs = 0
         self._scratch_vocab = 0
         self._scratch_spec = 0
@@ -87,7 +88,15 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
 
     @abstractmethod
     def _beam_width(self, vocab: int) -> int:
-        """Return the backend's frontier width."""
+        """Return the backend's maximum frontier width (buffer sizing)."""
+
+    def _depth_width(self, max_width: int, depth_slot: int) -> int:
+        """Return the per-depth frontier width, clipped to ``max_width``.
+
+        Fixed-width backends (prefix) return the same width on every layer;
+        beam overrides this to consume an optional ``branch_ks`` list.
+        """
+        return self._beam_width(max_width)
 
     def _pool_capacity(self, width: int, spec_num: int) -> int:
         return width * spec_num
@@ -329,17 +338,21 @@ def create_tree_builder(
     correction_scorer=None,
     prefix_len: int = 0,
     params: dict | None = None,
+    branch_ks: list[int] | None = None,
 ) -> TreeBuilder:
     """Construct the builder for ``method`` after backend pairing check.
 
     ``params`` is forwarded to prefix (``candidate_size`` only).
-    Beam ignores it.
+    Beam ignores it. ``branch_ks`` (beam only) is a per-depth expansion
+    width list overriding ``topk`` per layer.
     """
     validate_tree_method_backend(method, draft_backend)
     if method == "beam":
         from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
 
-        return BeamTreeBuilder(budget, topk, draft_model=draft_model)
+        return BeamTreeBuilder(
+            budget, topk, draft_model=draft_model, branch_ks=branch_ks
+        )
     if method == "prefix":
         from vllm_ascend.worker.v2.spec_decode.tree.prefix import PrefixTreeBuilder
 
